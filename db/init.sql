@@ -114,6 +114,25 @@ CREATE TABLE issue_batches (
 );
 
 -- ----------------------------------------------------------------------------
+-- 更正声明表：针对已签发证书的展示字段（设备名称/操作员/备注）登记更正声明。
+-- declaration_no 为幂等键（全局唯一）；seq 为同一证书内按成功登记顺序分配的
+-- 序号（从 1 开始），合并展示时按 seq 升序逐条覆盖生效。corrections 仅保存
+-- 本次提交的字段：值为 JSON null 表示显式置空，未提交的字段保持原值——两者
+-- 严格区分。request_hash 为规范化请求指纹：同编号同内容重试返回首次声明，
+-- 同编号不同内容判冲突。本表只增不改，原证书内容不受更正影响。
+-- ----------------------------------------------------------------------------
+CREATE TABLE correction_declarations (
+    declaration_no TEXT PRIMARY KEY,                 -- 声明编号（幂等键，业务唯一）
+    cert_no        TEXT NOT NULL REFERENCES certificates(cert_no), -- 被更正的证书
+    seq            INT NOT NULL,                     -- 该证书内的登记顺序（从 1 开始）
+    corrections    JSONB NOT NULL,                   -- 修正字段集合（仅提交的字段）
+    reason         TEXT NOT NULL,                    -- 更正原因
+    request_hash   TEXT NOT NULL,                    -- 规范化请求的 SHA-256 指纹
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (cert_no, seq)
+);
+
+-- ----------------------------------------------------------------------------
 -- 触发器 1：证书签发内容不可改写
 -- 仅允许 status / revoked_reason / revoked_at 在撤销事务中变化；
 -- 其余业务字段（编号、设备、时间、结论、引用关系等）一律拒绝 UPDATE。
@@ -163,6 +182,24 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_certificates_no_delete
     BEFORE DELETE ON certificates
     FOR EACH ROW EXECUTE FUNCTION certificates_no_delete();
+
+-- ----------------------------------------------------------------------------
+-- 触发器 3：更正声明只增不改、不得删除（声明历史不可篡改，顺序不可重排）
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION corrections_immutable() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'correction declarations are append-only (declaration_no=%)', OLD.declaration_no
+        USING ERRCODE = 'check_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_corrections_no_update
+    BEFORE UPDATE ON correction_declarations
+    FOR EACH ROW EXECUTE FUNCTION corrections_immutable();
+
+CREATE TRIGGER trg_corrections_no_delete
+    BEFORE DELETE ON correction_declarations
+    FOR EACH ROW EXECUTE FUNCTION corrections_immutable();
 
 -- ----------------------------------------------------------------------------
 -- 查询视图：统一将枚举以文本形式暴露给应用层

@@ -52,6 +52,26 @@ class RevokeRequest(BaseModel):
     operator: str | None = Field(None, max_length=128)
 
 
+class CorrectionDeclarationRequest(BaseModel):
+    """登记更正声明：仅可更正 device_name / operator / remark 三个展示字段。
+
+    corrections 为本次提交的修正字段集合（非空）：字段值为 null 表示显式置空，
+    未提交的字段保持原值——两者严格区分。declaration_no 为幂等键：同编号同内容
+    重试返回首次声明，同编号不同内容报冲突。
+    """
+    declaration_no: str = Field(
+        ..., min_length=1, max_length=128,
+        description="声明编号（全局唯一，幂等键）",
+    )
+    cert_no: str = Field(..., min_length=1, max_length=128, description="被更正的证书编号")
+    corrections: dict[str, str | None] = Field(
+        ...,
+        description="修正字段集合（非空）：仅 device_name/operator/remark；"
+        "值为 null 表示显式置空，未提交的字段保持不变",
+    )
+    reason: str = Field(..., max_length=1024, description="更正原因（非空）")
+
+
 class BatchIssueItem(_IssueBase):
     """批次中的单张证书，沿用单张签发的字段与规则。
 
@@ -164,6 +184,44 @@ class DownstreamItem(BaseModel):
     cert_no: str
     depth: int
     status: CertStatus
+
+
+class CorrectionDeclarationOut(BaseModel):
+    declaration_no: str
+    cert_no: str
+    seq: int = Field(..., description="该证书内按成功登记顺序分配的序号，从 1 开始")
+    corrections: dict[str, str | None] = Field(
+        ..., description="本次提交的修正字段集合；null 表示显式置空"
+    )
+    reason: str
+    created_at: datetime
+
+
+class CorrectionDisplay(BaseModel):
+    """按登记顺序合并全部声明后的当前展示值（仅三个可更正字段）。"""
+    device_name: str | None = None
+    operator: str | None = None
+    remark: str | None = None
+
+
+class CertificateCorrectionsOut(BaseModel):
+    """证书的更正视图：原证书 + 声明历史 + 合并后的当前展示。"""
+    cert_no: str
+    certificate: CertificateOut = Field(..., description="原证书（签发内容，不受更正影响）")
+    declarations: list[CorrectionDeclarationOut] = Field(
+        ..., description="声明历史，按登记顺序（seq）升序"
+    )
+    display: CorrectionDisplay = Field(..., description="合并后的当前展示")
+
+
+class CorrectionDeclarationResponse(BaseModel):
+    """登记结果 / 按声明编号查询：首次声明 + 所属证书的当前更正视图。"""
+    declaration: CorrectionDeclarationOut
+    certificate: CertificateOut = Field(..., description="原证书（签发内容，不受更正影响）")
+    declarations: list[CorrectionDeclarationOut] = Field(
+        ..., description="该证书的全部声明历史，按登记顺序（seq）升序"
+    )
+    display: CorrectionDisplay = Field(..., description="合并后的当前展示")
 
 
 class DownstreamOut(BaseModel):

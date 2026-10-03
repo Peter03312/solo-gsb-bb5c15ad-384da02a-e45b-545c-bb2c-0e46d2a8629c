@@ -3,7 +3,8 @@
 可离线运行的计量校准证书签发与**量值溯源链**管理服务。以基准（标准）设备的合格证书为
 追溯起点，普通校准证书必须引用一张在**校准时刻有效且合格**的标准设备证书；撤销上游
 证书时，其全部下游证书级联失效。离线采集的校准记录可作为**交接批次**整批签发：
-批次键幂等、整批原子落库、批内证书可相互引用。
+批次键幂等、整批原子落库、批内证书可相互引用。已签发证书的设备名称、操作员、备注
+录入有误时，可登记**更正声明**：声明按登记顺序生效、只增不改，原证书内容不受影响。
 
 - 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg3
 - 关键业务不变量由**数据库约束 + 触发器 + 单事务**保证，不依赖应用层“先查后写”，
@@ -23,7 +24,7 @@
 │   ├── db.py            # 连接池
 │   ├── config.py        # 环境变量配置
 │   └── errors.py        # 统一业务错误
-├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、签发批次表）
+├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、签发批次表、更正声明表）
 ├── scripts/             # 冒烟测试脚本（可直接对运行中的服务执行）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -123,6 +124,17 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
    `details.cert_no` 定位出错编号。批次键为幂等键：同键同请求重放首次签发结果
    快照（即使证书事后被撤销），同键不同请求返回 `409 batch_conflict`；
    并发重复提交由批次键主键兜底，仅一个事务真正落库。
+9. **更正声明（展示字段纠错）**：已签发证书的 `device_name` / `operator` / `remark`
+   录入有误时，可登记更正声明（唯一声明编号 + 证书编号 + 非空修正字段集合 +
+   非空原因）。仅这三个展示字段可更正；修正集合中字段值为 `null` 表示**显式置空**，
+   与**未提交**的字段（保持原值）严格区分。每张证书的声明按成功登记顺序编号
+   （`seq`，从 1 开始）并依序生效——同一字段后登记的声明覆盖先登记的。
+   声明写入只增不改的 `correction_declarations` 表，**不改写原证书**：证书详情、
+   追溯链、批次首次签发快照保持既有内容与响应契约；已撤销（REVOKED）或级联
+   失效（INVALID）的证书同样可更正展示资料，其状态、有效期与签发、撤销判定
+   不受影响。声明编号为幂等键：同编号同内容重试返回首次声明（HTTP 200），
+   同编号不同内容返回 `409 correction_conflict`；同一证书的并发更正由证书行锁
+   串行化，声明顺序不丢失、不乱序。
 
 证书状态：`ACTIVE` 生效中 / `REVOKED` 被主动撤销 / `INVALID` 因上游撤销级联失效。
 
@@ -299,6 +311,76 @@ curl -sS http://localhost:8080/api/v1/certificate-batches/HANDOFF-2026-10-03-001
 
 返回与签发响应同构的快照，不受事后撤销影响；批次不存在返回 `404 batch_not_found`。
 
+### 9. 登记更正声明（纠正展示字段录入错误）
+
+证书签发后业务字段不可改写；若 `device_name` / `operator` / `remark` 录入有误，
+通过更正声明纠错（仅这三个展示字段可更正）：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/correction-declarations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "declaration_no": "CORR-2026-0001",
+    "cert_no": "CAL-WS-001",
+    "corrections": {
+      "device_name": "车间万用表A（FLUKE-17B）",
+      "operator": null
+    },
+    "reason": "设备名称少录型号，操作员误填需置空"
+  }'
+```
+
+- `corrections` 为**非空**修正字段集合：只接受 `device_name` / `operator` / `remark`；
+  字段值为 `null` 表示**显式置空**，**未提交**的字段保持原值，两者严格区分；
+- 首次登记响应 `201`；同编号同内容重试响应 `200`，返回首次声明（不重复登记）；
+  同编号不同内容响应 `409 correction_conflict`；
+- 已撤销 / 已失效证书同样可更正，其状态、有效期与签发、撤销判定不受影响。
+
+响应（`200`/`201`）包含声明顺序、原证书、声明历史与合并后的当前展示：
+
+```json
+{
+  "declaration": {
+    "declaration_no": "CORR-2026-0001",
+    "cert_no": "CAL-WS-001",
+    "seq": 1,
+    "corrections": {"device_name": "车间万用表A（FLUKE-17B）", "operator": null},
+    "reason": "设备名称少录型号，操作员误填需置空",
+    "created_at": "2026-10-03T10:25:30.123456+00:00"
+  },
+  "certificate": {"cert_no": "CAL-WS-001", "device_name": "车间万用表A", "operator": "李工", ...},
+  "declarations": [
+    {"declaration_no": "CORR-2026-0001", "seq": 1, ...}
+  ],
+  "display": {"device_name": "车间万用表A（FLUKE-17B）", "operator": null, "remark": null}
+}
+```
+
+其中 `certificate` 始终是**签发时的原始内容**（不受更正影响）；`declarations` 为该证书
+全部声明按登记顺序（`seq`）升序排列；`display` 为按序合并后的当前展示——同一字段
+后登记的声明覆盖先登记的。
+
+### 10. 查询证书的更正视图（声明历史 + 合并展示）
+
+```bash
+curl -sS http://localhost:8080/api/v1/certificates/CAL-WS-001/corrections | python3 -m json.tool
+```
+
+返回 `cert_no`、`certificate`（原证书）、`declarations`（声明历史，按 `seq` 升序）与
+`display`（合并后的当前展示）；证书不存在返回 `404 cert_not_found`。
+
+### 11. 按声明编号查询
+
+```bash
+curl -sS http://localhost:8080/api/v1/correction-declarations/CORR-2026-0001 | python3 -m json.tool
+```
+
+返回首次登记的声明及所属证书的当前更正视图（与登记响应同构）；
+声明不存在返回 `404 declaration_not_found`。
+
+> 注意：`GET /api/v1/certificates/{cert_no}`、追溯链与批次快照始终返回签发时的
+> 原始字段值；合并后的展示值只通过上述更正相关接口获取。
+
 ---
 
 ## 错误响应
@@ -307,10 +389,15 @@ curl -sS http://localhost:8080/api/v1/certificate-batches/HANDOFF-2026-10-03-001
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
-| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` | 目标不存在 |
+| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` | 目标不存在 |
 | 409 | `cert_duplicate` | 证书编号已存在（含并发重复签发、批次与库内冲突） |
 | 409 | `batch_conflict` | 同一批次键提交了内容不同的签发请求 |
+| 409 | `correction_conflict` | 同一声明编号提交了内容不同的更正请求 |
 | 422 | `batch_cert_duplicate` | 批次内证书编号重复 |
+| 422 | `correction_empty` | 更正声明的修正字段集合为空 |
+| 422 | `correction_field_not_allowed` | 更正了 device_name/operator/remark 之外的字段（`details.fields` 点名） |
+| 422 | `correction_field_invalid` | 更正字段值越界（如长度超限） |
+| 422 | `correction_reason_required` | 更正原因为空或纯空白 |
 | 422 | `invalid_reference` | 引用的标准证书不存在（库内与本批均找不到） |
 | 422 | `reference_not_active` | 引用了已撤销/已失效证书（失效证书不得作依据） |
 | 422 | `reference_not_qualified` | 引用的标准证书结论为不合格 |
@@ -333,10 +420,15 @@ curl -sS http://localhost:8080/api/v1/certificate-batches/HANDOFF-2026-10-03-001
 scripts/smoke-test.sh                 # 17 项主流程与错误路径
 python3 scripts/extra_checks.py       # 21 项并发/边界/中段撤销补充检查
 python3 scripts/batch_checks.py       # 批次签发：原子性/乱序引用/幂等重放/键冲突/并发
+python3 scripts/correction_checks.py  # 更正声明：顺序生效/显式置空/幂等/冲突/并发
 ```
 
 覆盖：基准登记、多级签发、无效引用、越界校准时刻、区间重叠（含首尾相接）、
 同编号并发与重叠区间并发（3 线程仅 1 成功）、中段撤销、级联失效、失效证书
 禁止引用、撤销后重签、历史可查、撤销批次回放，数据库层 UPDATE/DELETE 封印，
 以及批次签发的整批原子性、批内乱序引用与拓扑校验、同键重放（含事后撤销）、
-同键冲突、并发重复提交（5 线程仅 1 次首次签发）与批次查询。
+同键冲突、并发重复提交（5 线程仅 1 次首次签发）与批次查询；
+更正声明的登记与顺序生效、显式置空与未提交的区分、原证书/追溯链/批次快照
+不受更正影响、已撤销/已失效证书可更正且状态判定不变、同编号同内容重放
+（含键序无关）、同编号异内容冲突、同一证书并发更正（8 线程 seq 1..8 不丢失
+不乱序）、并发同编号（同内容仅 1 次登记、异内容仅 1 次成功）与全部错误路径。

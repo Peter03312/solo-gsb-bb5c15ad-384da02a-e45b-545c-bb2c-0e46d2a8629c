@@ -28,9 +28,11 @@ app = FastAPI(
     description=(
         "登记基准设备合格证书作为追溯起点，签发/撤销普通校准证书，"
         "校验引用有效性、防止成环与有效期重叠，撤销时级联失效下游证书；"
-        "支持离线采集批次的整批原子签发与批次键幂等重放。"
+        "支持离线采集批次的整批原子签发与批次键幂等重放；"
+        "支持对已签发证书的展示字段（设备名称/操作员/备注）登记更正声明，"
+        "声明按登记顺序生效且不改写原证书。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -76,6 +78,9 @@ def index():
             "GET  /api/v1/certificates/{cert_no}/chain",
             "GET  /api/v1/certificates/{cert_no}/downstream",
             "POST /api/v1/certificates/{cert_no}/revoke",
+            "POST /api/v1/correction-declarations",
+            "GET  /api/v1/correction-declarations/{declaration_no}",
+            "GET  /api/v1/certificates/{cert_no}/corrections",
             "GET  /api/v1/devices/{device_id}/certificates",
             "GET  /api/v1/revocations",
             "GET  /api/v1/revocations/{batch_id}",

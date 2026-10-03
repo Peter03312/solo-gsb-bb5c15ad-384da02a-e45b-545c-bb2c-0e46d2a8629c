@@ -10,6 +10,9 @@
 - GET    /api/v1/certificates/{cert_no}/chain  完整追溯引用链
 - GET    /api/v1/certificates/{cert_no}/downstream  全部下游证书（影响面预览）
 - POST   /api/v1/certificates/{cert_no}/revoke 撤销证书并级联失效下游
+- POST   /api/v1/correction-declarations       登记更正声明（展示字段纠错，声明编号幂等）
+- GET    /api/v1/correction-declarations/{declaration_no}  按声明编号查询
+- GET    /api/v1/certificates/{cert_no}/corrections  证书更正视图（声明历史+合并展示）
 - GET    /api/v1/devices/{device_id}/certificates  某设备全部证书（含历史）
 - GET    /api/v1/revocations                   撤销批次列表
 - GET    /api/v1/revocations/{batch_id}        撤销批次详情（受影响证书及引用链）
@@ -23,6 +26,7 @@ from . import repository as repo
 from .schemas import (
     BatchIssueRequest,
     CertificateIssueRequest,
+    CorrectionDeclarationRequest,
     ReferenceIssueRequest,
     RevokeRequest,
 )
@@ -102,6 +106,32 @@ def revoke_certificate(
 ):
     with pool.connection() as conn:
         return repo.revoke_certificate(conn, cert_no, req.reason, req.operator)
+
+
+@router.post("/correction-declarations", status_code=201)
+def register_correction(
+    req: CorrectionDeclarationRequest, response: Response, pool: ConnectionPool = Depends(pool_dep)
+):
+    """登记更正声明：仅更正展示字段；声明编号幂等（同内容重放返回 200 与首次声明）。"""
+    with pool.connection() as conn:
+        body, created = repo.register_correction(conn, req)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.get("/correction-declarations/{declaration_no}")
+def get_correction_declaration(declaration_no: str, pool: ConnectionPool = Depends(pool_dep)):
+    """按声明编号查询：首次登记的声明 + 所属证书的当前更正视图。"""
+    with pool.connection() as conn:
+        return repo.get_correction_declaration(conn, declaration_no)
+
+
+@router.get("/certificates/{cert_no}/corrections")
+def get_certificate_corrections(cert_no: str, pool: ConnectionPool = Depends(pool_dep)):
+    """证书的更正视图：原证书、声明历史（按登记顺序）与合并后的当前展示。"""
+    with pool.connection() as conn:
+        return repo.get_certificate_corrections(conn, cert_no)
 
 
 @router.get("/devices/{device_id}/certificates")

@@ -585,6 +585,158 @@ def get_issue_batch(conn, batch_key: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 更正声明（展示字段纠错：设备名称 / 操作员 / 备注）
+# ---------------------------------------------------------------------------
+
+# 仅允许更正的展示字段及其长度上限（与签发模型一致）
+CORRECTABLE_FIELDS = ("device_name", "operator", "remark")
+_CORRECTION_MAX_LEN = {"device_name": 256, "operator": 128, "remark": 1024}
+
+_DECL_COLS = "declaration_no, cert_no, seq, corrections, reason, created_at"
+
+
+def _validate_correction_request(req) -> dict:
+    """校验修正字段集合与更正原因；返回提交原样的 corrections（区分显式置空与未提交）。"""
+    corrections = dict(req.corrections)
+    if not corrections:
+        raise ApiError(
+            422, "correction_empty",
+            "修正字段集合不能为空：至少提交一个待更正的展示字段",
+        )
+    unknown = sorted(set(corrections) - set(CORRECTABLE_FIELDS))
+    if unknown:
+        raise ApiError(
+            422, "correction_field_not_allowed",
+            f"仅允许更正展示字段 {', '.join(CORRECTABLE_FIELDS)}；"
+            f"收到不允许更正的字段: {', '.join(unknown)}",
+            details={"fields": unknown},
+        )
+    for field, value in corrections.items():
+        if value is not None and len(value) > _CORRECTION_MAX_LEN[field]:
+            raise ApiError(
+                422, "correction_field_invalid",
+                f"字段 {field} 长度超出上限 {_CORRECTION_MAX_LEN[field]} 字符",
+                details={"field": field, "max_length": _CORRECTION_MAX_LEN[field]},
+            )
+    if not req.reason or not req.reason.strip():
+        raise ApiError(422, "correction_reason_required", "更正原因不能为空")
+    return corrections
+
+
+def _correction_request_hash(cert_no: str, corrections: dict, reason: str) -> str:
+    """规范化请求指纹：键序无关；显式置空（null）与未提交该字段是不同的请求。"""
+    canonical = json.dumps(
+        {"cert_no": cert_no, "corrections": corrections, "reason": reason},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _get_declaration_row(conn, declaration_no: str, with_hash: bool = False) -> dict | None:
+    cols = _DECL_COLS + (", request_hash" if with_hash else "")
+    return conn.execute(
+        f"SELECT {cols} FROM correction_declarations WHERE declaration_no = %s",
+        (declaration_no,),
+    ).fetchone()
+
+
+def _correction_view(conn, cert_no: str) -> dict:
+    """证书的更正视图：原证书 + 按登记顺序排列的声明历史 + 合并后的当前展示。"""
+    certificate = get_certificate(conn, cert_no)
+    declarations = conn.execute(
+        f"SELECT {_DECL_COLS} FROM correction_declarations "
+        "WHERE cert_no = %s ORDER BY seq ASC",
+        (cert_no,),
+    ).fetchall()
+    # 按登记顺序（seq 升序）逐条覆盖：同一字段后登记的声明覆盖先登记的；
+    # 值为 None 表示显式置空，未提交的字段不参与合并
+    display = {field: certificate[field] for field in CORRECTABLE_FIELDS}
+    for decl in declarations:
+        display.update(decl["corrections"])
+    return {"certificate": certificate, "declarations": declarations, "display": display}
+
+
+def _correction_response(conn, existing_row: dict, req_hash: str) -> dict:
+    """声明编号已登记：同内容 → 返回首次声明及当前更正视图；异内容 → 409。"""
+    row = dict(existing_row)
+    row.pop("request_hash")
+    if existing_row["request_hash"] != req_hash:
+        raise ApiError(
+            409, "correction_conflict",
+            f"声明编号 {row['declaration_no']} 已用于一份内容不同的更正声明；"
+            "同一声明编号只允许重放完全相同的请求",
+            details={"declaration_no": row["declaration_no"]},
+        )
+    return {"declaration": row, **_correction_view(conn, row["cert_no"])}
+
+
+def register_correction(conn, req) -> tuple[dict, bool]:
+    """登记更正声明，返回 (响应体, 是否首次登记)。
+
+    - 仅 device_name / operator / remark 可更正；修正集合非空、原因非空；
+    - 已撤销（REVOKED）/已失效（INVALID）证书同样可更正展示资料，
+      状态、有效期与签发/撤销判定不受影响（不触碰 certificates 表）；
+    - 声明编号幂等：同编号同内容重试返回首次声明（不重复登记），
+      同编号不同内容返回 409 correction_conflict；
+    - 并发安全：登记前对被更正证书行加 FOR UPDATE 锁，同一证书的并发更正
+      在此串行化，seq 按成功登记顺序分配，不丢失、不乱序；不同证书的相同
+      声明编号并发提交由主键兜底，后到事务回滚后按已提交内容重放/判冲突。
+    """
+    corrections = _validate_correction_request(req)
+    req_hash = _correction_request_hash(req.cert_no, corrections, req.reason)
+    try:
+        with conn.transaction():
+            locked = conn.execute(
+                "SELECT cert_no FROM certificates WHERE cert_no = %s FOR UPDATE",
+                (req.cert_no,),
+            ).fetchone()
+            if locked is None:
+                raise ApiError(404, "cert_not_found", f"证书不存在: {req.cert_no}")
+
+            existing = _get_declaration_row(conn, req.declaration_no, with_hash=True)
+            if existing is not None:
+                return _correction_response(conn, existing, req_hash), False
+
+            seq = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq "
+                "FROM correction_declarations WHERE cert_no = %s",
+                (req.cert_no,),
+            ).fetchone()["next_seq"]
+            conn.execute(
+                """
+                INSERT INTO correction_declarations
+                    (declaration_no, cert_no, seq, corrections, reason, request_hash)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    req.declaration_no, req.cert_no, seq,
+                    Jsonb(corrections), req.reason, req_hash,
+                ),
+            )
+            declaration = _get_declaration_row(conn, req.declaration_no)
+    except psycopg.errors.UniqueViolation:
+        # 并发同声明编号（多见于不同证书并行提交）：主键兜底，按已提交内容重放或判冲突
+        existing = _get_declaration_row(conn, req.declaration_no, with_hash=True)
+        if existing is not None:
+            return _correction_response(conn, existing, req_hash), False
+        raise
+    return {"declaration": declaration, **_correction_view(conn, req.cert_no)}, True
+
+
+def get_certificate_corrections(conn, cert_no: str) -> dict:
+    """按证书查询更正视图：原证书、声明历史（按登记顺序）与合并后的当前展示。"""
+    return {"cert_no": cert_no, **_correction_view(conn, cert_no)}
+
+
+def get_correction_declaration(conn, declaration_no: str) -> dict:
+    """按声明编号查询：首次登记的声明 + 所属证书的当前更正视图。"""
+    row = _get_declaration_row(conn, declaration_no)
+    if row is None:
+        raise ApiError(404, "declaration_not_found", f"更正声明不存在: {declaration_no}")
+    return {"declaration": row, **_correction_view(conn, row["cert_no"])}
+
+
+# ---------------------------------------------------------------------------
 # 撤销与级联失效
 # ---------------------------------------------------------------------------
 
