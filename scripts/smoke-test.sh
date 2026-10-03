@@ -83,6 +83,52 @@ echo "== 9. 历史内容仍可查 =="
 expect 200 "$($CURL -o /tmp/st_hist.json -w '%{http_code}' "$BASE/api/v1/devices/DEV-CUS-B/certificates")" "设备历史可查"
 grep -q '"status":"INVALID"' /tmp/st_hist.json && ok "历史证书状态为 INVALID 且内容保留" || bad "历史内容"
 
+echo "== 10. 证书登记更正声明（仅展示字段） =="
+expect 201 "$($CURL -o /tmp/st_cref.json -w '%{http_code}' -X POST "$BASE/api/v1/reference-certificates" -d '{
+  "cert_no":"REF-CORR","device_id":"DEV-CORR","device_name":"更正前名称",
+  "valid_from":"2026-02-01T00:00:00+08:00","valid_to":"2028-02-01T00:00:00+08:00",
+  "calibrated_at":"2026-02-01T09:00:00+08:00","operator":"更正前操作员","remark":"更正前备注"}')" "更正演示用证书"
+
+expect 201 "$($CURL -o /tmp/st_corr1.json -w '%{http_code}' -X POST "$BASE/api/v1/certificates/REF-CORR/corrections" -d '{
+  "statement_no":"STMT-SMOKE-1","changes":{"device_name":"更正后名称","operator":"更正后操作员"},
+  "reason":"录入笔误"}')" "登记更正声明1"
+grep -q '"seq":1' /tmp/st_corr1.json && ok "声明1 seq=1" || bad "声明1 seq"
+
+# remark 显式置空（null），未提交的 device_name/operator 保持
+expect 201 "$($CURL -o /tmp/st_corr2.json -w '%{http_code}' -X POST "$BASE/api/v1/certificates/REF-CORR/corrections" -d '{
+  "statement_no":"STMT-SMOKE-2","changes":{"remark":null},"reason":"备注误录需清空"}')" "声明2 显式置空 remark"
+grep -q '"remark":null' /tmp/st_corr2.json && grep -q '"device_name":"更正后名称"' /tmp/st_corr2.json \
+  && ok "显式置空生效，未提交字段保持" || bad "置空/保持合并"
+
+# 同编号同内容重试 -> 200，返回首次声明
+expect 200 "$($CURL -o /tmp/st_replay.json -w '%{http_code}' -X POST "$BASE/api/v1/certificates/REF-CORR/corrections" -d '{
+  "statement_no":"STMT-SMOKE-2","changes":{"remark":null},"reason":"备注误录需清空"}')" "同编号同内容重试 200"
+# 同编号异内容 -> 409
+expect 409 "$($CURL -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/certificates/REF-CORR/corrections" -d '{
+  "statement_no":"STMT-SMOKE-2","changes":{"operator":"甲"},"reason":"冲突内容"}')" "同编号异内容 409"
+# 字段越界 / 空修正 / 空原因 / 证书不存在
+expect 422 "$($CURL -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/certificates/REF-CORR/corrections" -d '{
+  "statement_no":"STMT-SMOKE-X","changes":{"status":"REVOKED"},"reason":"x"}')" "越界字段 422"
+expect 422 "$($CURL -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/certificates/REF-CORR/corrections" -d '{
+  "statement_no":"STMT-SMOKE-X","changes":{},"reason":"x"}')" "空修正 422"
+expect 422 "$($CURL -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/certificates/REF-CORR/corrections" -d '{
+  "statement_no":"STMT-SMOKE-X","changes":{"operator":"甲"},"reason":"  "}'
+)" "空原因 422"
+expect 404 "$($CURL -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/certificates/NO-SUCH-CERT/corrections" -d '{
+  "statement_no":"STMT-SMOKE-X","changes":{"operator":"甲"},"reason":"x"}')" "证书不存在 404"
+
+# 查询：声明历史 + 原证书 + 合并当前展示
+expect 200 "$($CURL -o /tmp/st_corrl.json -w '%{http_code}' "$BASE/api/v1/certificates/REF-CORR/corrections")" "查询声明历史"
+grep -q '"device_name":"更正前名称"' /tmp/st_corrl.json && ok "原证书签发内容保持原样" || bad "原证书内容"
+grep -q '"seq":2' /tmp/st_corrl.json && ok "声明历史按顺序返回" || bad "声明历史顺序"
+
+# 撤销后仍可更正，且状态判定不变
+expect 200 "$($CURL -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/certificates/REF-CORR/revoke" -d '{
+  "reason":"演示撤销","operator":"qa"}')" "撤销更正演示证书"
+expect 201 "$($CURL -o /tmp/st_corr3.json -w '%{http_code}' -X POST "$BASE/api/v1/certificates/REF-CORR/corrections" -d '{
+  "statement_no":"STMT-SMOKE-3","changes":{"device_name":"撤销后仍可更正名称"},"reason":"撤销后补正"}')" "已撤销证书仍可更正"
+grep -q '"status":"REVOKED"' /tmp/st_corr3.json && ok "更正不改变证书状态" || bad "状态保持"
+
 echo
 echo "结果: PASS=$pass FAIL=$fail"
 [ "$fail" -eq 0 ]

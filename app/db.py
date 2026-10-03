@@ -23,6 +23,70 @@ CREATE TABLE IF NOT EXISTS issue_batches (
     cert_nos     TEXT[] NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 证书登记更正声明（展示资料更正，只增不改；不触碰 certificates 封印行）
+CREATE OR REPLACE FUNCTION cert_corrections_changes_valid(changes JSONB)
+RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    e record;
+BEGIN
+    IF jsonb_typeof(changes) IS DISTINCT FROM 'object' OR changes = '{}'::jsonb THEN
+        RETURN false;
+    END IF;
+    FOR e IN SELECT key, value FROM jsonb_each(changes) LOOP
+        IF e.key NOT IN ('device_name', 'operator', 'remark') THEN
+            RETURN false;
+        END IF;
+        -- jsonb 中的 null 是合法值（显式置空）；标量变量需用 IS DISTINCT FROM 判空
+        IF e.value IS DISTINCT FROM 'null'::jsonb
+           AND jsonb_typeof(e.value) <> 'string' THEN
+            RETURN false;
+        END IF;
+    END LOOP;
+    RETURN true;
+END;
+$$;
+
+CREATE TABLE IF NOT EXISTS cert_corrections (
+    statement_no TEXT PRIMARY KEY,
+    cert_no      TEXT NOT NULL REFERENCES certificates(cert_no),
+    seq          INT  NOT NULL,
+    changes      JSONB NOT NULL,
+    reason       TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    response     JSONB NOT NULL,
+    declared_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT cert_corrections_seq_positive CHECK (seq > 0),
+    CONSTRAINT cert_corrections_changes_shape
+        CHECK (cert_corrections_changes_valid(changes)),
+    CONSTRAINT cert_corrections_reason_nonempty CHECK (length(btrim(reason)) > 0),
+    CONSTRAINT cert_corrections_seq_unique UNIQUE (cert_no, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_cert_corrections_cert ON cert_corrections(cert_no, seq);
+
+CREATE OR REPLACE FUNCTION cert_corrections_immutable() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'correction statement % is sealed: declarations cannot be modified',
+        OLD.statement_no
+        USING ERRCODE = 'check_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_cert_corrections_immutable_update') THEN
+        CREATE TRIGGER trg_cert_corrections_immutable_update
+            BEFORE UPDATE ON cert_corrections
+            FOR EACH ROW EXECUTE FUNCTION cert_corrections_immutable();
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_cert_corrections_immutable_delete') THEN
+        CREATE TRIGGER trg_cert_corrections_immutable_delete
+            BEFORE DELETE ON cert_corrections
+            FOR EACH ROW EXECUTE FUNCTION cert_corrections_immutable();
+    END IF;
+END
+$$;
 """
 
 

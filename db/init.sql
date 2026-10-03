@@ -114,9 +114,85 @@ CREATE TABLE issue_batches (
 );
 
 -- ----------------------------------------------------------------------------
+-- 更正声明表：已签发证书的设备名称/操作员/备注等展示资料登记更正（只增不改）
+--
+-- 更正不触碰 certificates 行本身（既有不可改写封印完全不变）：
+--   * statement_no        唯一声明编号（幂等键，全局唯一）
+--   * cert_no             被更正证书（声明登记时必须已存在；证书后续撤销/失效不影响声明）
+--   * seq                 该证书范围内的声明顺序号，按成功登记顺序 1,2,3… 分配
+--   * changes             本次修正字段集合，仅允许 device_name/operator/remark 三个键；
+--                         键存在即“显式提交”（值可为 JSON null，表示置空），
+--                         键缺省即“未提交”，两者严格区分
+--   * reason              更正原因（非空）
+--   * response            首次登记结果快照（同编号同内容重放时原样返回）
+-- ----------------------------------------------------------------------------
+
+-- CHECK 约束内不允许子查询，用 IMMUTABLE 函数做 changes 形状校验：
+-- 必须是非空 JSON 对象、只含三个可更正字段、每个值为文本或 JSON null。
+CREATE OR REPLACE FUNCTION cert_corrections_changes_valid(changes JSONB)
+RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    e record;
+BEGIN
+    IF jsonb_typeof(changes) IS DISTINCT FROM 'object' OR changes = '{}'::jsonb THEN
+        RETURN false;
+    END IF;
+    FOR e IN SELECT key, value FROM jsonb_each(changes) LOOP
+        IF e.key NOT IN ('device_name', 'operator', 'remark') THEN
+            RETURN false;
+        END IF;
+        -- jsonb 中的 null 是合法值（显式置空）；标量变量需用 IS DISTINCT FROM 判空
+        IF e.value IS DISTINCT FROM 'null'::jsonb
+           AND jsonb_typeof(e.value) <> 'string' THEN
+            RETURN false;
+        END IF;
+    END LOOP;
+    RETURN true;
+END;
+$$;
+
+CREATE TABLE cert_corrections (
+    statement_no TEXT PRIMARY KEY,             -- 声明编号（业务唯一键、幂等键）
+    cert_no      TEXT NOT NULL REFERENCES certificates(cert_no),
+    seq          INT  NOT NULL,                -- 该证书内的声明顺序号（从 1 开始）
+    changes      JSONB NOT NULL,               -- 修正字段集合（显式置空为 null，未提交即缺键）
+    reason       TEXT NOT NULL,                -- 更正原因（非空）
+    request_hash TEXT NOT NULL,                -- 规范化请求的 SHA-256 指纹（同编号判冲突）
+    response     JSONB NOT NULL,               -- 首次登记结果快照（重放原样返回）
+    declared_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT cert_corrections_seq_positive CHECK (seq > 0),
+    CONSTRAINT cert_corrections_changes_shape
+        CHECK (cert_corrections_changes_valid(changes)),
+    CONSTRAINT cert_corrections_reason_nonempty CHECK (length(btrim(reason)) > 0),
+    CONSTRAINT cert_corrections_seq_unique UNIQUE (cert_no, seq)
+);
+CREATE INDEX idx_cert_corrections_cert ON cert_corrections(cert_no, seq);
+
+-- ----------------------------------------------------------------------------
+-- 触发器 3：更正声明只增不改（登记后不可 UPDATE、不可 DELETE）
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION cert_corrections_immutable() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'correction statement % is sealed: declarations cannot be modified',
+        OLD.statement_no
+        USING ERRCODE = 'check_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_cert_corrections_immutable_update
+    BEFORE UPDATE ON cert_corrections
+    FOR EACH ROW EXECUTE FUNCTION cert_corrections_immutable();
+
+CREATE TRIGGER trg_cert_corrections_immutable_delete
+    BEFORE DELETE ON cert_corrections
+    FOR EACH ROW EXECUTE FUNCTION cert_corrections_immutable();
+
+-- ----------------------------------------------------------------------------
 -- 触发器 1：证书签发内容不可改写
 -- 仅允许 status / revoked_reason / revoked_at 在撤销事务中变化；
 -- 其余业务字段（编号、设备、时间、结论、引用关系等）一律拒绝 UPDATE。
+-- 更正声明不改写本表：设备名称等展示字段的“当前值”由声明历史合并得到。
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION certificates_immutable() RETURNS trigger AS $$
 BEGIN

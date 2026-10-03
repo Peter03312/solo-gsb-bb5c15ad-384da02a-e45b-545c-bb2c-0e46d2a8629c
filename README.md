@@ -23,8 +23,12 @@
 │   ├── db.py            # 连接池
 │   ├── config.py        # 环境变量配置
 │   └── errors.py        # 统一业务错误
-├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、签发批次表）
+├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、签发批次表、更正声明表）
 ├── scripts/             # 冒烟测试脚本（可直接对运行中的服务执行）
+│   ├── smoke-test.sh          # 主流程与错误路径
+│   ├── extra_checks.py        # 并发/边界/中段撤销
+│   ├── batch_checks.py        # 批次签发
+│   └── correction_checks.py   # 更正声明
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -125,6 +129,22 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
    并发重复提交由批次键主键兜底，仅一个事务真正落库。
 
 证书状态：`ACTIVE` 生效中 / `REVOKED` 被主动撤销 / `INVALID` 因上游撤销级联失效。
+
+9. **登记更正声明（展示资料更正）**：已签发证书的设备名称、操作员、备注三个**展示
+   字段**录入有误时，通过 `POST /api/v1/certificates/{cert_no}/corrections` 登记
+   更正声明——**不触碰证书原始行**（不可改写封印、追溯链节点、签发批次快照均原样
+   保留），当前展示值由声明历史按生效顺序合并得到：
+   - 输入唯一**声明编号**（幂等键）、非空**修正字段集合** `changes` 与非空**原因**；
+     `changes` 仅允许 `device_name` / `operator` / `remark` 三个键；
+   - **显式置空与未提交严格区分**：键出现且值为 `null` 表示把该字段显式置空，
+     键缺省表示本次未提交、保持现值（空串 `""` 同样是显式提交的文本值）；
+   - 每张证书的声明按**成功登记顺序**分配顺序号 `seq=1,2,3…`（对证书行加行锁
+     串行化并发更正，不丢失、不乱序），登记结果与查询都返回声明顺序、**原证书**、
+     **声明历史**与**合并后的当前展示**；
+   - 同声明编号同内容重试返回首次声明（`200`，首次时点快照），同编号异内容
+     （含登记到不同证书）返回 `409 correction_conflict`；
+   - **已撤销/级联失效证书同样可更正**展示资料，但状态、有效期及签发/撤销判定
+     完全不受影响；声明表只增不改（触发器禁止 UPDATE/DELETE）。
 
 ---
 
@@ -299,6 +319,91 @@ curl -sS http://localhost:8080/api/v1/certificate-batches/HANDOFF-2026-10-03-001
 
 返回与签发响应同构的快照，不受事后撤销影响；批次不存在返回 `404 batch_not_found`。
 
+### 9. 登记证书更正声明（仅展示字段，声明按顺序生效）
+
+已签发证书的设备名称、操作员、备注录入有误时，登记一条**更正声明**。更正不改写
+证书本身，原证书详情、追溯链节点与签发批次快照保持既有内容；当前展示值由声明
+历史合并得到。
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/certificates/CAL-WS-001/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "statement_no": "CORR-2026-10-03-001",
+    "changes": {
+      "device_name": "车间万用表A（02号车间）",
+      "operator": "李工（复核：赵工）"
+    },
+    "reason": "签发时名称与操作员录入笔误"
+  }'
+```
+
+`changes` 规则（**显式置空与未提交严格区分**）：
+
+- 仅允许 `device_name` / `operator` / `remark` 三个键，且集合非空；
+- 键出现、值为文本 → 将该字段更正为新文本；
+- 键出现、值为 `null` → **显式置空**该字段；
+- 键缺省 → **未提交**，该字段保持现值（不受本声明影响）。
+
+首次登记响应 `201`，返回声明顺序号、原证书、声明历史与合并后的当前展示：
+
+```json
+{
+  "statement": {
+    "statement_no": "CORR-2026-10-03-001",
+    "cert_no": "CAL-WS-001",
+    "seq": 1,
+    "changes": {"device_name": "车间万用表A（02号车间）", "operator": "李工（复核：赵工）"},
+    "fields": ["device_name", "operator"],
+    "reason": "签发时名称与操作员录入笔误",
+    "declared_at": "2026-10-03T12:00:00+00:00"
+  },
+  "cert_no": "CAL-WS-001",
+  "certificate": {"cert_no": "CAL-WS-001", "device_name": "车间万用表A", "status": "ACTIVE", "...": "原证书签发内容原样"},
+  "corrections": [ {"statement_no": "CORR-2026-10-03-001", "seq": 1, "...": "..."} ],
+  "current_display": {
+    "device_name": "车间万用表A（02号车间）",
+    "operator": "李工（复核：赵工）",
+    "remark": null
+  }
+}
+```
+
+显式置空示例（仅清空备注，名称/操作员未提交故保持现值）：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/certificates/CAL-WS-001/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"statement_no": "CORR-2026-10-03-002", "changes": {"remark": null}, "reason": "备注误录，予以清空"}'
+```
+
+幂等与冲突约定：
+
+- **同编号同内容重试** → `200`，返回首次声明结果快照（即使其后又登记了新声明或
+  证书被撤销；判定只看请求内容，JSON 键序不同不影响）；
+- **同编号异内容**（同一声明编号提交了不同的字段集合/值/原因/目标证书）→
+  `409 correction_conflict`；
+- **并发更正同一证书** → 按成功登记顺序串行分配 `seq`，不丢失、不乱序；
+  并发抢用同一新声明编号时仅一个事务首次落库，其余按内容重放或判冲突。
+
+适用范围与不变量：
+
+- 已撤销（`REVOKED`）与级联失效（`INVALID`）证书**也可以更正展示资料**；
+  状态、有效期、撤销原因/时间以及“失效证书不得作为签发依据”等判定不受任何影响；
+- `GET /api/v1/certificates/{cert_no}`（原证书详情）、
+  `/chain`（追溯链）、`/downstream`、签发批次快照的响应契约与内容保持不变；
+- 声明一经登记不可修改、不可删除（数据库触发器强制）。
+
+查询某张证书的声明历史与合并后的当前展示：
+
+```bash
+# 原证书 + corrections（按 seq 升序的声明历史）+ current_display（合并后的当前展示）
+curl -sS http://localhost:8080/api/v1/certificates/CAL-WS-001/corrections | python3 -m json.tool
+
+# 按声明编号查询单条声明（同构返回原证书、完整声明历史与当前展示）
+curl -sS http://localhost:8080/api/v1/certificates/CAL-WS-001/corrections/CORR-2026-10-03-001
+```
+
 ---
 
 ## 错误响应
@@ -319,6 +424,11 @@ curl -sS http://localhost:8080/api/v1/certificate-batches/HANDOFF-2026-10-03-001
 | 422 | `validity_overlap` | 同设备已生效证书有效期重叠（含批内重叠） |
 | 409 | `validity_overlap_concurrent` | 并发签发重叠，排他约束兜底拒绝 |
 | 409 | `cert_not_active` | 撤销一张非 ACTIVE 证书 |
+| 404 | `correction_not_found` | 证书下不存在指定声明编号 |
+| 409 | `correction_conflict` | 同一声明编号提交了内容不同的更正请求（含并发抢用） |
+| 422 | `correction_empty` | `changes` 修正字段集合为空 |
+| 422 | `correction_field_invalid` | 修正字段越界（非三个展示字段）、值非文本/null、超长 |
+| 422 | `correction_reason_empty` | 更正原因为空或纯空白 |
 
 > 批次签发中由单条记录触发的校验错误与单张签发同码，并在 `details.cert_no`
 > 中给出出错证书编号（必要时附 `details.parent_cert_no` / `details.cycle` 等）。
@@ -330,13 +440,18 @@ curl -sS http://localhost:8080/api/v1/certificate-batches/HANDOFF-2026-10-03-001
 服务启动后执行（仅依赖 bash + curl / python3 标准库）：
 
 ```bash
-scripts/smoke-test.sh                 # 17 项主流程与错误路径
+scripts/smoke-test.sh                 # 34 项主流程与错误路径（含更正声明）
 python3 scripts/extra_checks.py       # 21 项并发/边界/中段撤销补充检查
 python3 scripts/batch_checks.py       # 批次签发：原子性/乱序引用/幂等重放/键冲突/并发
+python3 scripts/correction_checks.py  # 更正声明：顺序合并/显式置空/幂等冲突/并发不乱序/撤销失效可更正
 ```
 
 覆盖：基准登记、多级签发、无效引用、越界校准时刻、区间重叠（含首尾相接）、
 同编号并发与重叠区间并发（3 线程仅 1 成功）、中段撤销、级联失效、失效证书
 禁止引用、撤销后重签、历史可查、撤销批次回放，数据库层 UPDATE/DELETE 封印，
-以及批次签发的整批原子性、批内乱序引用与拓扑校验、同键重放（含事后撤销）、
-同键冲突、并发重复提交（5 线程仅 1 次首次签发）与批次查询。
+批次签发的整批原子性、批内乱序引用与拓扑校验、同键重放（含事后撤销）、
+同键冲突、并发重复提交（5 线程仅 1 次首次签发）与批次查询；以及更正声明的
+顺序生效与当前展示合并、显式置空(null)与未提交(缺键)区分、空串显式提交、
+同编号同内容重放与异内容冲突（含跨证书、含 8 线程并发）、字段越界/空修正/
+空原因/超长报错、已撤销与级联失效证书更正后状态与有效期判定不变、
+声明表 UPDATE/DELETE 封印与声明查询。

@@ -11,6 +11,9 @@
 - GET    /api/v1/certificates/{cert_no}/downstream  全部下游证书（影响面预览）
 - POST   /api/v1/certificates/{cert_no}/revoke 撤销证书并级联失效下游
 - GET    /api/v1/devices/{device_id}/certificates  某设备全部证书（含历史）
+- POST   /api/v1/certificates/{cert_no}/corrections  登记更正声明（仅展示字段）
+- GET    /api/v1/certificates/{cert_no}/corrections  声明历史 + 原证书 + 当前展示
+- GET    /api/v1/certificates/{cert_no}/corrections/{statement_no}  单条声明（含历史与当前展示）
 - GET    /api/v1/revocations                   撤销批次列表
 - GET    /api/v1/revocations/{batch_id}        撤销批次详情（受影响证书及引用链）
 """
@@ -23,6 +26,7 @@ from . import repository as repo
 from .schemas import (
     BatchIssueRequest,
     CertificateIssueRequest,
+    CorrectionRequest,
     ReferenceIssueRequest,
     RevokeRequest,
 )
@@ -108,6 +112,39 @@ def revoke_certificate(
 def device_history(device_id: str, pool: ConnectionPool = Depends(pool_dep)):
     with pool.connection() as conn:
         return repo.get_device_history(conn, device_id)
+
+
+@router.post("/certificates/{cert_no}/corrections", status_code=201)
+def register_correction(
+    cert_no: str,
+    req: CorrectionRequest,
+    response: Response,
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """登记证书登记更正声明（仅设备名称/操作员/备注三个展示字段）。
+
+    同声明编号同内容重放返回 200 与首次声明；同编号异内容 409 correction_conflict。
+    已撤销/级联失效证书也可更正，状态、有效期与签发/撤销判定不受影响。
+    """
+    with pool.connection() as conn:
+        body, created = repo.register_correction(conn, cert_no, req)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.get("/certificates/{cert_no}/corrections")
+def get_corrections(cert_no: str, pool: ConnectionPool = Depends(pool_dep)):
+    """声明历史（按生效顺序）+ 原证书 + 合并后的当前展示。"""
+    with pool.connection() as conn:
+        return repo.get_corrections(conn, cert_no)
+
+
+@router.get("/certificates/{cert_no}/corrections/{statement_no}")
+def get_correction(cert_no: str, statement_no: str, pool: ConnectionPool = Depends(pool_dep)):
+    """按声明编号查询单条声明（同构返回原证书、声明历史与当前展示）。"""
+    with pool.connection() as conn:
+        return repo.get_correction(conn, cert_no, statement_no)
 
 
 @router.get("/revocations")

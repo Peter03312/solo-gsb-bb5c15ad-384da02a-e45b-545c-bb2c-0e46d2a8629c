@@ -5,7 +5,7 @@
 有效期统一按半开区间 [valid_from, valid_to) 解释，首尾相接不算重叠。
 """
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -50,6 +50,34 @@ class CertificateIssueRequest(_IssueBase):
 class RevokeRequest(BaseModel):
     reason: str = Field(..., min_length=1, max_length=1024, description="撤销原因")
     operator: str | None = Field(None, max_length=128)
+
+
+# 允许通过更正声明修正的展示字段（其余字段一律不接受）
+CORRECTABLE_FIELDS = ("device_name", "operator", "remark")
+# 各字段长度上限与签发接口保持一致
+CORRECTABLE_MAX_LENGTH = {"device_name": 256, "operator": 128, "remark": 1024}
+
+
+class CorrectionRequest(BaseModel):
+    """证书登记更正声明：修正设备名称/操作员/备注三个展示字段。
+
+    - statement_no: 唯一声明编号（幂等键）；同编号同内容重试返回首次声明，
+      同编号异内容报 409 correction_conflict。
+    - changes: 非空修正字段集合。键存在即“显式提交”，值为 null 表示显式置空；
+      未出现的键即“未提交”，保持既有值不变——显式置空与未提交严格区分。
+    - reason: 非空更正原因。
+    """
+    statement_no: str = Field(
+        ..., min_length=1, max_length=128, description="唯一声明编号（幂等键）"
+    )
+    changes: dict[str, Any] = Field(
+        ...,
+        description=(
+            "修正字段集合，仅允许 device_name/operator/remark；"
+            "值为 null 表示显式置空，键缺省表示未提交"
+        ),
+    )
+    reason: str = Field(..., min_length=1, max_length=1024, description="更正原因")
 
 
 class BatchIssueItem(_IssueBase):
@@ -176,6 +204,34 @@ class PagedCertificates(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class CorrectionOut(BaseModel):
+    """单条更正声明（声明历史中的一项，按生效顺序返回）。"""
+    statement_no: str
+    cert_no: str
+    seq: int = Field(..., description="该证书范围内的声明顺序号，从 1 开始")
+    changes: dict[str, str | None] = Field(
+        ..., description="本次提交的修正字段；显式置空为 null，未提交的键不出现"
+    )
+    fields: list[str] = Field(..., description="本次修正字段名（排序后，便于直观核对集合）")
+    reason: str
+    declared_at: datetime
+
+
+class CorrectionBundle(BaseModel):
+    """更正声明查询统一载体：原证书 + 声明历史 + 合并后的当前展示。"""
+    cert_no: str
+    certificate: CertificateOut = Field(..., description="原证书（签发内容，不被更正改写）")
+    corrections: list[CorrectionOut] = Field(..., description="声明历史，按 seq 升序")
+    current_display: dict[str, str | None] = Field(
+        ..., description="合并全部声明后的三个展示字段当前值"
+    )
+
+
+class CorrectionResponse(CorrectionBundle):
+    """登记结果：新声明在前，另附原证书、声明历史与合并后的当前展示。"""
+    statement: CorrectionOut
 
 
 class ErrorBody(BaseModel):
